@@ -1,0 +1,182 @@
+import subprocess
+import os
+import glob
+import hashlib
+import logging
+import re
+from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher, types, executor
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.utils.exceptions import BadRequest
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+
+# Загрузка переменных из .env файла
+load_dotenv()
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+
+API_TOKEN = os.getenv("API_TOKEN")  # Загружаем API токен из переменной окружения
+CHANNEL_USERNAME = '@bbacckkeennddtestchannell'  # Замените на ваш канал
+
+# Используем MemoryStorage
+memory_storage = MemoryStorage()
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot, storage=memory_storage)
+
+DOWNLOAD_PATH = "downloads"
+MAX_FILE_SIZE_MB = 50
+
+if not os.path.exists(DOWNLOAD_PATH):
+    os.makedirs(DOWNLOAD_PATH)
+
+def generate_short_id(url: str) -> str:
+    return hashlib.md5(url.encode()).hexdigest()[:8]
+
+async def download_media(url: str) -> str:
+    try:
+        output_path_template = os.path.join(DOWNLOAD_PATH, "%(title)s.%(ext)s")
+        
+        if "youtube" in url:
+            # Для YouTube скачиваем видео и аудио в mp4
+            command = [
+                "yt-dlp",
+                "-f", "bestaudio[ext=m4a]+bestvideo[ext=mp4]/best",
+                "--merge-output-format", "mp4",
+                "-o", output_path_template,
+                url,
+            ]
+        elif "instagram" in url:
+            # Для Instagram скачиваем видео и аудио в mp4
+            command = [
+                "yt-dlp",
+                "-f", "bestaudio[ext=m4a]+bestvideo[ext=mp4]/best",
+                "--merge-output-format", "mp4",
+                "-o", output_path_template,
+                url,
+            ]
+        else:
+            command = [
+                "yt-dlp",
+                "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best",
+                "--merge-output-format", "mp4",
+                "-o", output_path_template,
+                url,
+            ]
+        
+        subprocess.run(command, check=True)
+        
+        # Пытаемся найти последний скачанный файл
+        downloaded_files = glob.glob(os.path.join(DOWNLOAD_PATH, "*.mp4"))
+        if downloaded_files:
+            return max(downloaded_files, key=os.path.getctime)
+        return None
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Ошибка скачивания: {e}")
+        return None
+    except Exception as e:
+        logging.exception("Непредвиденная ошибка при скачивании")
+        return None
+
+async def is_subscribed(user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        return member.status in ['member', 'administrator', 'creator']
+    except Exception:
+        return False
+
+@dp.message_handler(commands=['start', 'help'])
+async def send_welcome(message: types.Message):
+    if not await is_subscribed(message.from_user.id):
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(InlineKeyboardButton("Подписаться на канал", url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}"))
+        keyboard.add(InlineKeyboardButton("Проверить подписку", callback_data="check_subscription"))
+        await message.reply(
+            "Чтобы использовать бота, пожалуйста, подпишитесь на наш канал и нажмите кнопку 'Проверить подписку'.",
+            reply_markup=keyboard
+        )
+    else:
+        await message.reply("Привет! Отправь мне ссылку на видео с YouTube или Instagram (reel/reels), и я скачаю его.")
+
+@dp.callback_query_handler(lambda c: c.data == 'check_subscription')
+async def handle_subscription_check(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    if await is_subscribed(user_id):
+        await callback_query.answer("Вы успешно подписаны! Теперь можете использовать бота.", show_alert=True)
+        await bot.send_message(user_id, "Отправьте мне ссылку на видео.")
+    else:
+        await callback_query.answer("Вы пока не подписаны. Подпишитесь и попробуйте снова.", show_alert=True)
+
+@dp.message_handler(content_types=['text'])
+async def handle_link(message: types.Message):
+    if not await is_subscribed(message.from_user.id):
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(InlineKeyboardButton("Подписаться на канал", url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}"))
+        keyboard.add(InlineKeyboardButton("Проверить подписку", callback_data="check_subscription"))
+        await message.reply(
+            "Чтобы использовать бота, пожалуйста, подпишитесь на наш канал и нажмите кнопку 'Проверить подписку'.",
+            reply_markup=keyboard
+        )
+        return
+
+    url = message.text.strip()
+
+    if not (url.startswith("http://") or url.startswith("https://")):
+        await message.reply("Пожалуйста, отправьте корректную ссылку.")
+        return
+
+    youtube_regex = r"(?:https?://)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v\/|e\/|watch\?v=))|youtu\.be\/)([a-zA-Z0-9_-]{11})"
+    instagram_regex = r"(?:https?://)?(?:www\.)?instagram\.com\/(?:reel\/|reels\/)([a-zA-Z0-9_-]+)"
+
+    if re.match(youtube_regex, url) or re.match(instagram_regex, url):
+        short_id = generate_short_id(url)
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(InlineKeyboardButton("Загрузить видео", callback_data=f"download_{short_id}"))
+        await message.reply("Нажмите кнопку для скачивания видео:", reply_markup=keyboard)
+        await dp.storage.set_data(chat=message.chat.id, user=message.from_user.id, data={short_id: url})
+    else:
+        await message.reply("Пожалуйста, отправьте ссылку на видео с YouTube или Instagram (reel/reels).")
+
+@dp.callback_query_handler(lambda c: c.data.startswith('download_'))
+async def handle_download(callback_query: types.CallbackQuery):
+    try:
+        short_id = callback_query.data.split("_", 1)[1]
+        data = await dp.storage.get_data(chat=callback_query.message.chat.id, user=callback_query.from_user.id)
+        url = data.get(short_id)
+
+        if not url:
+            await callback_query.answer("Ссылка не найдена. Попробуйте отправить ее снова.", show_alert=True)
+            return
+
+        await callback_query.answer("Начинаю загрузку...")
+
+        file_path = await download_media(url)
+
+        if file_path:
+            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            if file_size_mb > MAX_FILE_SIZE_MB:
+                await bot.send_message(callback_query.from_user.id, f"Файл слишком большой ({file_size_mb:.2f} MB). Максимальный размер: {MAX_FILE_SIZE_MB} MB.")
+                os.remove(file_path)
+                return
+
+            await bot.send_message(callback_query.from_user.id, "Отправляю видео...")
+            try:
+                with open(file_path, 'rb') as video:
+                    await bot.send_video(callback_query.from_user.id, video)
+                os.remove(file_path)  # Удаляем файл после отправки
+            except Exception as e:
+                logging.exception("Ошибка при отправке видео:")
+                await bot.send_message(callback_query.from_user.id, "Произошла ошибка при отправке видео. Попробуйте позже.")
+                try:
+                    os.remove(file_path)  # Удаляем файл даже если произошла ошибка отправки
+                except OSError:
+                    pass
+        else:
+            await bot.send_message(callback_query.from_user.id, "Ошибка загрузки. Проверьте ссылку или попробуйте позже.")
+    except BadRequest as e:
+        logging.exception("Ошибка обработки callback_query:")
+        await bot.send_message(callback_query.from_user.id, "Произошла ошибка при обработке запроса. Попробуйте снова.")
+
+# Запуск бота
+if __name__ == '__main__':
+    executor.start_polling(dp, skip_updates=True)
